@@ -2,3 +2,5 @@
 
 + LeNet
 + AlexNet
++ VGG
++ GoogLeNet
