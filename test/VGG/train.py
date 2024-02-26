@@ -7,7 +7,7 @@ from model.VGG import vgg
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import transforms, datasets, utils
+from torchvision import transforms, datasets
 
 
 def main():
