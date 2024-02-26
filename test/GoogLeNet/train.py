@@ -34,7 +34,7 @@ def main():
     cla_dict = dict((val, key) for key, val in flower_list.items())
     # write dict into json file
     json_str = json.dumps(cla_dict, indent=4)
-    with open('test/VGG/class_indices.json', 'w') as json_file:
+    with open('test/GoogLeNet/class_indices.json', 'w') as json_file:
         json_file.write(json_str)
 
     batch_size = 32
