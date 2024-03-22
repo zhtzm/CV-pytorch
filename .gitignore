@@ -1,2 +1,4 @@
+.gitignore
 .vscode
 save_model
+__pycache__
