@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+sys.path.append('E:/Github/Image-Classification')
 
 import torch
 import torch.nn as nn

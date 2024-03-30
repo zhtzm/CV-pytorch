@@ -4,6 +4,8 @@ import torchvision
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
+import sys
+sys.path.append('E:/Github/Image-Classification')
 
 
 def main():

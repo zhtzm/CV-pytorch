@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+sys.path.append('E:/Github/Image-Classification')
 
 from matplotlib import pyplot as plt
 import numpy as np

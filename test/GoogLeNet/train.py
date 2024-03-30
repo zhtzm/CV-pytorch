@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+sys.path.append('E:/Github/Image-Classification')
 
 from tqdm import tqdm
 from model.GoogLeNet import GoogLeNet

@@ -1,16 +1,69 @@
-from collections import OrderedDict
-from functools import partial
+from copy import deepcopy
+import numpy as np
 from torch import Tensor
 import torch
 import torch.nn as nn
+import torch.functional as F
 
-from model.DropPath import DropPath
+
+class VisionTransformer(nn.Module):
+    def __init__(self,
+                 image_size: int,
+                 patch_size: int,
+                 num_layers: int,
+                 num_heads: int,
+                 in_channel:int,
+                 hidden_dim: int,
+                 mlp_dim: int,
+                 dropout: float = 0.0,
+                 attention_dropout: float = 0.0,
+                 num_classes: int = 1000
+                ):
+        super(VisionTransformer, self).__init__()
+        self.patch_embed = PatchEmbed(image_size, patch_size, in_channel, hidden_dim, nn.LayerNorm)
+        seq_length = self.patch_embed.num_patches
+
+        self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        seq_length += 1
+
+        self.pos_enc = PositionalEncodering(seq_length, hidden_dim)
+        mlp_layer = MLP(in_dim=hidden_dim, hidden_dim=mlp_dim, drop=dropout)
+        d_k = d_v = hidden_dim // num_heads
+        assert d_k * num_heads == hidden_dim
+        encoder_layer = TransformerEncoderLayer(hidden_dim, num_heads, d_k, d_v, mlp_layer, attention_dropout, dropout, nn.Dropout, True)
+        norm = nn.LayerNorm(hidden_dim)
+        self.encoder = TransformerEncoder(encoder_layer, num_layers, norm)
+
+        self.heads = nn.Linear(hidden_dim, num_classes)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+        n = x.shape[0]
+        batch_class_token = self.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+        x = self.pos_enc(x)
+        x, _ = self.encoder(x)
+        x = x[:, 0]
+        x = self.heads(x)
+        x = self.softmax(x)
+        return x
+    
+
+class PositionalEncodering(nn.Module):
+    def __init__(self, seq_length, hidden_dim, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.pos_embedding = nn.Parameter(torch.empty(1, seq_length, hidden_dim).normal_(std=0.02))
+
+    def forward(self, x):
+        """
+            input: x(B, seq_length, E)
+            output: x(B, seq_length, E)
+        """
+        return x + self.pos_embedding
 
 
 class PatchEmbed(nn.Module):
-    """
-    2D Image to Patch Embedding
-    """
     def __init__(self,
                  image_size=224,
                  patch_size=16,
@@ -23,7 +76,6 @@ class PatchEmbed(nn.Module):
     
         self.img_size = image_size
         self.patch_size = patch_size
-        # 按patch裁剪后的HxW
         self.grid_size = (self.img_size[0] // self.patch_size[0],
                           self.img_size[1] // self.patch_size[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
@@ -33,230 +85,207 @@ class PatchEmbed(nn.Module):
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, X: Tensor):
+        """
+            input: X(B, C, H, W)
+            output: X(B, N, embeding)
+        """
         _, _, H, W = X.shape
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         
         X = self.proj(X)
         X = X.flatten(2).transpose(1, 2)
-        # 这里flatten展平第二维之后即H'维和W'维,此时shape=(B, C, H'W')=(B, C, num_patches)
-        # transpose用于交换轴,这里交换1,2轴,shape变为(B, num_patches, C),可理解为每个batch中做转置
         X = self.norm(X)
-
-        return X
-    
-class Attention(nn.Module):
-    def __init__(self,
-                 dim,   # embed_dim,也指下面的C
-                 num_heads=8,
-                 qkv_bias=False,
-                 qk_scale=None,
-                 attn_drop_ratio=0.,
-                 proj_drop_ratio=0.):
-        super(Attention, self).__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5   
-        # attention = softmax(QTV/sqrt(d)) @ V, 这个scale就是指代sqrt(d)这个用于调节的参数,当然我们可以给定超参数
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        # 这里应该时直接通过一个升维,我们直接从中截取出qkv,这里就用到XW等效cat(QW1, KW2, VW3)的原理
-        self.attn_drop = nn.Dropout(attn_drop_ratio)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop_ratio)
-
-    def forward(self, X):
-        B, N, C = X.shape
-        # 一般理解这里的X是embedding(patch_embedding+position_embedding)
-
-        qkv = self.qkv(X).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        # qkv(): -> [B, N, 3 * C]
-        # reshape: -> [B, N, 3, num_heads, C // num_heads]
-        # permute: -> [3, B, num_heads, N, C // num_heads]
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        # shape(B, num_heads, N, N)
-        X = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        X = self.proj(X)
-        X = self.proj_drop(X)
-        # shape(B, N, C)
 
         return X
     
 
 class MLP(nn.Module):
     def __init__(self, 
-                 in_features, 
-                 hidden_features=None, 
-                 out_features=None, 
+                 in_dim: int, 
+                 hidden_dim: int, 
                  act_layer=nn.GELU, 
                  drop=0.):
         super(MLP, self).__init__()
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_dim, in_dim)
+        self.drop1 = nn.Dropout(drop)
+        self.drop2 = nn.Dropout(drop)
 
     def forward(self, x):
+        """
+            input: x(B, N, in_dim)
+            output: x(B, N, in_dim)
+        """
         x = self.fc1(x)
         x = self.act(x)
-        x = self.drop(x)
+        x = self.drop1(x)
         x = self.fc2(x)
-        x = self.drop(x)
+        x = self.drop2(x)
         return x
 
 
-class Block(nn.Module):
+class TransformerEncoder(nn.Module):
     def __init__(self,
-                 dim,
-                 num_heads,
-                 qkv_bias=False,
-                 qk_scale=None,
-                 drop_ratio=0.,
-                 attn_drop_ratio=0.,
-                 drop_path_ratio=0.,
-                 mlp_ratio=4.,
-                 act_layer=nn.GELU,
-                 norm_layer=nn.LayerNorm):
-        super(Block, self).__init__()   
-        self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim=dim,
-                              num_heads=num_heads,
-                              qkv_bias=qkv_bias,
-                              qk_scale=qk_scale,
-                              attn_drop_ratio=attn_drop_ratio,
-                              proj_drop_ratio=drop_ratio)
-        self.drop_path = DropPath(drop_prob=drop_path_ratio) if drop_path_ratio > 0. \
-            else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = MLP(in_features=dim,
-                       hidden_features=mlp_hidden_dim,
-                       act_layer=act_layer,
-                       drop=drop_ratio)
+                 encoder_layer: nn.Module,
+                 num_encoder_layers: int,
+                 norm: nn.Module = None
+                 ) -> None:
+        super(TransformerEncoder, self).__init__()
+        self.layers = _get_clones(encoder_layer, num_encoder_layers)
+        self.norm = norm
+
+    def forward(self, enc_inputs):  
+        enc_outputs = enc_inputs        
+        enc_self_attns = []
+        for layer in self.layers:
+            enc_outputs, enc_self_attn = layer(enc_outputs)  
+            enc_self_attns.append(enc_self_attn)
+        if self.norm is not None:
+            enc_outputs = self.norm(enc_outputs)
+        return enc_outputs, enc_self_attns
+
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self,
+                 d_model: int,
+                 n_head: int, 
+                 d_k: int, 
+                 d_v: int,
+                 ffn_layer: nn.Module,
+                 attention_dropout: float = 0.,
+                 dropout: float = 0.,
+                 drop_layer: nn.Module = nn.Dropout,
+                 norm_first: bool = False
+                 ) -> None:
+        super(TransformerEncoderLayer, self).__init__()
+        self.norm_first = norm_first
+        self.attention = MultiHeadAttention(d_model, n_head, d_k, d_v, attention_dropout)
+        self.ffn = ffn_layer
+        self.drop1 = drop_layer(p=dropout) if dropout > 0. else nn.Identity()
+        self.drop2 = drop_layer(p=dropout) if dropout > 0. else nn.Identity()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, enc_inputs):
+        """
+            inputs:
+                enc_inputs: (batch_size, src_len, d_model)
+            outputs:
+                enc_outputs: (batch_size, src_len, d_model)
+                attn: (batch_size, n_heads, src_len, src_len)
+        """
+        if self.norm_first:
+            residual = enc_inputs
+            enc_outputs = self.norm1(enc_inputs)
+            enc_outputs, attn = self.attention(enc_outputs, enc_outputs, enc_outputs)
+            enc_outputs = self.drop1(enc_outputs)
+            enc_outputs += residual
+
+            residual = enc_outputs
+            enc_outputs = self.norm2(enc_outputs)
+            enc_outputs = self.ffn(enc_outputs)
+            enc_outputs = self.drop2(enc_outputs)
+            enc_outputs += residual
+        else:
+            residual = enc_inputs
+            enc_outputs, attn = self.attention(enc_inputs, enc_inputs, enc_inputs)
+            enc_outputs = self.drop1(enc_outputs)
+            enc_outputs += residual
+            enc_outputs = self.norm1(enc_outputs)
+
+            residual = enc_outputs
+            enc_outputs = self.ffn(enc_outputs)
+            enc_outputs = self.drop2(enc_outputs)
+            enc_outputs += residual
+            enc_outputs = self.norm2(enc_outputs)
         
-    def forward(self, X):
-        X = X + self.drop_path(self.attn(self.norm1(X)))
-        X = X + self.drop_path(self.mlp(self.norm2(X)))
-        return X
+        return enc_outputs, attn
 
 
-class VisionTransformer(nn.Module):
+class MultiHeadAttention(nn.Module):
     def __init__(self,
-                 num_classes=1000,
-                 distilled=False,
-                 embed_dim=768,
-                 drop_ratio=0.,
-                 act_layer=None,
-                 norm_layer=None,
-                 image_size=224,
-                 patch_size=16,
-                 in_c=3,
-                 embed_layer=PatchEmbed,
-                 num_heads=12,
-                 mlp_ratio=4.0,
-                 qkv_bias=True,
-                 qk_scale=None,
-                 drop_path_ratio=0., 
-                 depth=12,
-                 attn_drop_ratio=0.,
-                 representation_size=None, 
+                 d_model: int,
+                 n_head: int,
+                 d_k: int,
+                 d_v: int,
+                 p_dropout: float = 0.
                  ):
-        super(VisionTransformer, self).__init__()
-        self.num_classes = num_classes
-        self.features = self.embed_dim = embed_dim
-        self.num_tokens = 2 if distilled else 1
-        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
-        act_layer = act_layer or nn.GELU
+        super(MultiHeadAttention, self).__init__()
+        self.n_head = n_head
+        self.d_k = d_k
+        self.d_v = d_v
+        self.W_Q = nn.Linear(d_model, d_k * n_head, bias=False)
+        self.drop1 = nn.Dropout(p=p_dropout)
+        self.W_K = nn.Linear(d_model, d_k * n_head, bias=False)
+        self.drop2 = nn.Dropout(p=p_dropout)
+        self.W_V = nn.Linear(d_model, d_v * n_head, bias=False)
+        self.drop3 = nn.Dropout(p=p_dropout)
+        self.sdpa = ScaledDotProductAttention()
+        self.fc = nn.Linear(d_v * n_head, d_model, bias=False)
+        self.drop4 = nn.Dropout(p=p_dropout)
 
-        self.patch_embed = embed_layer(image_size=image_size,
-                                       patch_size=patch_size,
-                                       in_c=in_c,
-                                       embed_dim=embed_dim)
-        num_patches = self.patch_embed.num_patches
+    def forward(self, Q: Tensor, K: Tensor, V: Tensor):
+        """
+            inputs:
+                Q: (batch_size, seq_len1, d_model)
+                K: (batch_size, seq_len2, d_model)
+                V: (batch_size, seq_len2, d_model]
+                mask: (batch_size, seq_len1, seq_len2)
+            outputs:
+                output: (batch_size, seq_len1, d_model)
+                attn: (batch_size, n_heads, seq_len1, seq_len2)
+        """
+        batch_size = Q.shape[0]
+        # Q -> (batch_size, seq_len1, d_k * n_head) -> (batch_size, seq_len1, n_head, d_k) -> (batch_size, n_head, seq_len1, d_k)
+        Q = self.W_Q(Q)
+        Q = self.drop1(Q).view(batch_size, -1, self.n_head, self.d_k).transpose(1,2)    
+        # K -> (batch_size, seq_len2, d_k * n_head) -> (batch_size, seq_len2, n_head, d_k) -> (batch_size, n_head, seq_len2, d_k)  
+        K = self.W_K(K)
+        K = self.drop2(K).view(batch_size, -1, self.n_head, self.d_k).transpose(1,2)      
+        # V -> (batch_size, seq_len2, d_v * n_head) -> (batch_size, seq_len2, n_head, d_v) -> (batch_size, n_head, seq_len2, d_v)
+        V = self.W_V(V)
+        V = self.drop3(V).view(batch_size, -1, self.n_head, self.d_v).transpose(1,2)      
+        # mask -> (batch_size, 1, seq_len1, seq_len2) -> (batch_size, n_heads, seq_len1, seq_len2)                  
+        context, attn = self.sdpa(Q, K, V)             
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_ratio)
+        # (batch_size, seq_len1, n_heads * d_v)                                                                      
+        context = context.transpose(1, 2).reshape(batch_size, -1, self.n_head * self.d_v)      
+        output = self.fc(context)    
+        output = self.drop4(output)
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_ratio, depth)]  # stochastic depth decay rule
-        self.blocks = nn.Sequential(*[
-            Block(dim=embed_dim, 
-                  num_heads=num_heads, 
-                  mlp_ratio=mlp_ratio, 
-                  qkv_bias=qkv_bias, 
-                  qk_scale=qk_scale,
-                  drop_ratio=drop_ratio, 
-                  attn_drop_ratio=attn_drop_ratio, 
-                  drop_path_ratio=dpr[i],
-                  norm_layer=norm_layer, 
-                  act_layer=act_layer)
-            for i in range(depth)
-        ])
-        self.norm = norm_layer(embed_dim)
+        return output, attn
+    
 
-        # Representation layer
-        if representation_size and not distilled:
-            self.has_logits = True
-            self.num_features = representation_size
-            self.pre_logits = nn.Sequential(OrderedDict([
-                ("fc", nn.Linear(embed_dim, representation_size)),
-                ("act", nn.Tanh())
-            ]))
-        else:
-            self.has_logits = False
-            self.pre_logits = nn.Identity()
+class ScaledDotProductAttention(nn.Module):
+    def __init__(self,) -> None:
+        super(ScaledDotProductAttention, self).__init__()
+        self.softmax = nn.Softmax(-1)
 
-        # Classifier head(s)
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
-        self.head_dist = None
-        if distilled:
-            self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
+    def forward(self, Q: Tensor, K: Tensor, V: Tensor):
+        """
+            inputs:
+                Q: (batch_size, n_head, seq_len1, d_k)
+                K: (batch_size, n_head, seq_len2, d_k)  
+                V: (batch_size, n_head, seq_len2, d_v)
+                mask: (batch_size, n_heads, seq_len1, seq_len2)
+            outputs:
+                context: (batch_size, n_heads, seq_len1, d_v)
+                attn: (batch_size, n_heads, seq_len1, seq_len2)
+        """
+        # scores (batch_size, n_heads, seq_len1, seq_len2)
+        scores = torch.matmul(Q, K.permute(0, 1, 3, 2)) / np.sqrt(Q.shape[-1])
+        # attn (batch_size, n_heads, seq_len1, seq_len2)
+        attn = self.softmax(scores)
+        # context (batch_size, n_heads, seq_len1, d_v)
+        context = torch.matmul(attn, V)                                 
+        return context, attn
+    
 
-        # Weight init
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        if self.dist_token is not None:
-            nn.init.trunc_normal_(self.dist_token, std=0.02)
-
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        self.apply(_init_vit_weights)
-
-    def forward_features(self, x):
-        # [B, C, H, W] -> [B, num_patches, embed_dim]
-        x = self.patch_embed(x)  # [B, 196, 768]
-        # [1, 1, 768] -> [B, 1, 768]
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
-        if self.dist_token is None:
-            x = torch.cat((cls_token, x), dim=1)  # [B, 197, 768]
-        else:
-            x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
-
-        x = self.pos_drop(x + self.pos_embed)
-        x = self.blocks(x)
-        x = self.norm(x)
-        if self.dist_token is None:
-            return self.pre_logits(x[:, 0])
-        else:
-            return x[:, 0], x[:, 1]
-
-    def forward(self, x):
-        x = self.forward_features(x)
-        if self.head_dist is not None:
-            x, x_dist = self.head(x[0]), self.head_dist(x[1])
-            if self.training and not torch.jit.is_scripting():
-                # during inference, return the average of both classifier predictions
-                return x, x_dist
-            else:
-                return (x + x_dist) / 2
-        else:
-            x = self.head(x)
-        return x
+def _get_clones(module, N):
+    return nn.ModuleList([deepcopy(module) for i in range(N)])
     
 
 def _init_vit_weights(m):
@@ -275,3 +304,13 @@ def _init_vit_weights(m):
     elif isinstance(m, nn.LayerNorm):
         nn.init.zeros_(m.bias)
         nn.init.ones_(m.weight)
+
+
+if __name__ == '__main__':
+    model = VisionTransformer(64, 8, 4, 4, 3, 256, 1024, 0.1, 0.1,  10)
+    print(model)
+
+    x = torch.rand((4, 3, 64, 64))
+    x = model(x)
+
+    print(x)
