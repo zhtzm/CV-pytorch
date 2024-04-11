@@ -1,4 +1,4 @@
-# 计算机视觉相关模型
+# 手搓CV模型
 
 + LeNet
 + AlexNet
