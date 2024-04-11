@@ -1,5 +1,5 @@
 .vscode
 save_model
 __pycache__
-.json
-.pth
+*.json
+*.pth

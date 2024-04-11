@@ -4,3 +4,6 @@
 + AlexNet
 + VGG
 + GoogLeNet
++ ResNet
++ ViT
++ ViViT
