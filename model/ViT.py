@@ -20,7 +20,7 @@ class VisionTransformer(nn.Module):
                  num_classes: int = 1000
                 ):
         super(VisionTransformer, self).__init__()
-        self.patch_embed = PatchEmbed(image_size, patch_size, in_channel, hidden_dim, nn.LayerNorm)
+        self.patch_embed = PatchEmbed(image_size, patch_size, in_channel, hidden_dim)
         seq_length = self.patch_embed.num_patches
 
         self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
@@ -32,10 +32,26 @@ class VisionTransformer(nn.Module):
         assert d_k * num_heads == hidden_dim
         encoder_layer = TransformerEncoderLayer(hidden_dim, num_heads, d_k, d_v, mlp_layer, attention_dropout, dropout, nn.Dropout, True)
         norm = nn.LayerNorm(hidden_dim)
-        self.encoder = TransformerEncoder(encoder_layer, num_layers, norm)
+        self.encoder = TransformerEncoder(encoder_layer, num_layers, dropout, norm)
 
         self.heads = nn.Linear(hidden_dim, num_classes)
         self.softmax = nn.Softmax(dim=-1)
+
+        self._init_vit_weights()
+
+    def _init_vit_weights(self):
+        for m in self: 
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.zeros_(m.bias)
+                nn.init.ones_(m.weight)
 
     def forward(self, x):
         x = self.patch_embed(x)
@@ -43,7 +59,7 @@ class VisionTransformer(nn.Module):
         batch_class_token = self.class_token.expand(n, -1, -1)
         x = torch.cat([batch_class_token, x], dim=1)
         x = self.pos_enc(x)
-        x, _ = self.encoder(x)
+        x = self.encoder(x)
         x = x[:, 0]
         x = self.heads(x)
         x = self.softmax(x)
@@ -68,8 +84,7 @@ class PatchEmbed(nn.Module):
                  image_size=224,
                  patch_size=16,
                  in_c=3,
-                 embed_dim=768,
-                 norm_layer=None):
+                 embed_dim=768):
         super(PatchEmbed, self).__init__()
         image_size = (image_size, image_size)
         patch_size = (patch_size, patch_size)
@@ -80,9 +95,8 @@ class PatchEmbed(nn.Module):
                           self.img_size[1] // self.patch_size[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
 
-        self.proj = nn.Conv2d(in_c, embed_dim, kernel_size=patch_size, 
+        self.conv_proj = nn.Conv2d(in_c, embed_dim, kernel_size=patch_size, 
                               stride=patch_size)
-        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, X: Tensor):
         """
@@ -93,9 +107,8 @@ class PatchEmbed(nn.Module):
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         
-        X = self.proj(X)
+        X = self.conv_proj(X)
         X = X.flatten(2).transpose(1, 2)
-        X = self.norm(X)
 
         return X
     
@@ -110,8 +123,8 @@ class MLP(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_dim, in_dim)
         self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_dim, in_dim)
         self.drop2 = nn.Dropout(drop)
 
     def forward(self, x):
@@ -131,21 +144,21 @@ class TransformerEncoder(nn.Module):
     def __init__(self,
                  encoder_layer: nn.Module,
                  num_encoder_layers: int,
+                 dropout: float = 0.0,
                  norm: nn.Module = None
                  ) -> None:
         super(TransformerEncoder, self).__init__()
+        self.drop = nn.Dropout(p=dropout)
         self.layers = _get_clones(encoder_layer, num_encoder_layers)
         self.norm = norm
 
     def forward(self, enc_inputs):  
-        enc_outputs = enc_inputs        
-        enc_self_attns = []
+        enc_outputs = self.drop(enc_inputs)       
         for layer in self.layers:
-            enc_outputs, enc_self_attn = layer(enc_outputs)  
-            enc_self_attns.append(enc_self_attn)
+            enc_outputs = layer(enc_outputs)  
         if self.norm is not None:
             enc_outputs = self.norm(enc_outputs)
-        return enc_outputs, enc_self_attns
+        return enc_outputs
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -154,7 +167,7 @@ class TransformerEncoderLayer(nn.Module):
                  n_head: int, 
                  d_k: int, 
                  d_v: int,
-                 ffn_layer: nn.Module,
+                 mlp_layer: nn.Module,
                  attention_dropout: float = 0.,
                  dropout: float = 0.,
                  drop_layer: nn.Module = nn.Dropout,
@@ -162,12 +175,11 @@ class TransformerEncoderLayer(nn.Module):
                  ) -> None:
         super(TransformerEncoderLayer, self).__init__()
         self.norm_first = norm_first
-        self.attention = MultiHeadAttention(d_model, n_head, d_k, d_v, attention_dropout)
-        self.ffn = ffn_layer
-        self.drop1 = drop_layer(p=dropout) if dropout > 0. else nn.Identity()
-        self.drop2 = drop_layer(p=dropout) if dropout > 0. else nn.Identity()
         self.norm1 = nn.LayerNorm(d_model)
+        self.attention = MultiHeadAttention(d_model, n_head, d_k, d_v, attention_dropout)
+        self.dropout = drop_layer(p=dropout) if dropout > 0. else nn.Identity()
         self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = mlp_layer
 
     def forward(self, enc_inputs):
         """
@@ -180,29 +192,27 @@ class TransformerEncoderLayer(nn.Module):
         if self.norm_first:
             residual = enc_inputs
             enc_outputs = self.norm1(enc_inputs)
-            enc_outputs, attn = self.attention(enc_outputs, enc_outputs, enc_outputs)
-            enc_outputs = self.drop1(enc_outputs)
+            enc_outputs, _ = self.attention(enc_outputs, enc_outputs, enc_outputs)
+            enc_outputs = self.dropout(enc_outputs)
             enc_outputs += residual
 
             residual = enc_outputs
             enc_outputs = self.norm2(enc_outputs)
-            enc_outputs = self.ffn(enc_outputs)
-            enc_outputs = self.drop2(enc_outputs)
+            enc_outputs = self.mlp(enc_outputs)
             enc_outputs += residual
         else:
             residual = enc_inputs
-            enc_outputs, attn = self.attention(enc_inputs, enc_inputs, enc_inputs)
-            enc_outputs = self.drop1(enc_outputs)
+            enc_outputs, _ = self.attention(enc_inputs, enc_inputs, enc_inputs)
+            enc_outputs = self.dropout(enc_outputs)
             enc_outputs += residual
             enc_outputs = self.norm1(enc_outputs)
 
             residual = enc_outputs
-            enc_outputs = self.ffn(enc_outputs)
-            enc_outputs = self.drop2(enc_outputs)
+            enc_outputs = self.mlp(enc_outputs)
             enc_outputs += residual
             enc_outputs = self.norm2(enc_outputs)
         
-        return enc_outputs, attn
+        return enc_outputs
 
 
 class MultiHeadAttention(nn.Module):
@@ -218,14 +228,10 @@ class MultiHeadAttention(nn.Module):
         self.d_k = d_k
         self.d_v = d_v
         self.W_Q = nn.Linear(d_model, d_k * n_head, bias=False)
-        self.drop1 = nn.Dropout(p=p_dropout)
         self.W_K = nn.Linear(d_model, d_k * n_head, bias=False)
-        self.drop2 = nn.Dropout(p=p_dropout)
         self.W_V = nn.Linear(d_model, d_v * n_head, bias=False)
-        self.drop3 = nn.Dropout(p=p_dropout)
-        self.sdpa = ScaledDotProductAttention()
+        self.sdpa = ScaledDotProductAttention(p_dropout)
         self.fc = nn.Linear(d_v * n_head, d_model, bias=False)
-        self.drop4 = nn.Dropout(p=p_dropout)
 
     def forward(self, Q: Tensor, K: Tensor, V: Tensor):
         """
@@ -240,28 +246,25 @@ class MultiHeadAttention(nn.Module):
         """
         batch_size = Q.shape[0]
         # Q -> (batch_size, seq_len1, d_k * n_head) -> (batch_size, seq_len1, n_head, d_k) -> (batch_size, n_head, seq_len1, d_k)
-        Q = self.W_Q(Q)
-        Q = self.drop1(Q).view(batch_size, -1, self.n_head, self.d_k).transpose(1,2)    
+        Q = self.W_Q(Q).view(batch_size, -1, self.n_head, self.d_k).transpose(1,2)
         # K -> (batch_size, seq_len2, d_k * n_head) -> (batch_size, seq_len2, n_head, d_k) -> (batch_size, n_head, seq_len2, d_k)  
-        K = self.W_K(K)
-        K = self.drop2(K).view(batch_size, -1, self.n_head, self.d_k).transpose(1,2)      
+        K = self.W_K(K).view(batch_size, -1, self.n_head, self.d_k).transpose(1,2)
         # V -> (batch_size, seq_len2, d_v * n_head) -> (batch_size, seq_len2, n_head, d_v) -> (batch_size, n_head, seq_len2, d_v)
-        V = self.W_V(V)
-        V = self.drop3(V).view(batch_size, -1, self.n_head, self.d_v).transpose(1,2)      
+        V = self.W_V(V).view(batch_size, -1, self.n_head, self.d_v).transpose(1,2)
         # mask -> (batch_size, 1, seq_len1, seq_len2) -> (batch_size, n_heads, seq_len1, seq_len2)                  
         context, attn = self.sdpa(Q, K, V)             
 
         # (batch_size, seq_len1, n_heads * d_v)                                                                      
         context = context.transpose(1, 2).reshape(batch_size, -1, self.n_head * self.d_v)      
         output = self.fc(context)    
-        output = self.drop4(output)
 
         return output, attn
     
 
 class ScaledDotProductAttention(nn.Module):
-    def __init__(self,) -> None:
+    def __init__(self, dropout) -> None:
         super(ScaledDotProductAttention, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
         self.softmax = nn.Softmax(-1)
 
     def forward(self, Q: Tensor, K: Tensor, V: Tensor):
@@ -279,6 +282,7 @@ class ScaledDotProductAttention(nn.Module):
         scores = torch.matmul(Q, K.permute(0, 1, 3, 2)) / np.sqrt(Q.shape[-1])
         # attn (batch_size, n_heads, seq_len1, seq_len2)
         attn = self.softmax(scores)
+        self.dropout(attn)
         # context (batch_size, n_heads, seq_len1, d_v)
         context = torch.matmul(attn, V)                                 
         return context, attn
@@ -286,31 +290,73 @@ class ScaledDotProductAttention(nn.Module):
 
 def _get_clones(module, N):
     return nn.ModuleList([deepcopy(module) for i in range(N)])
-    
-
-def _init_vit_weights(m):
-    """
-    ViT weight initialization
-    :param m: module
-    """
-    if isinstance(m, nn.Linear):
-        nn.init.trunc_normal_(m.weight, std=.01)
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.Conv2d):
-        nn.init.kaiming_normal_(m.weight, mode="fan_out")
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.LayerNorm):
-        nn.init.zeros_(m.bias)
-        nn.init.ones_(m.weight)
 
 
-if __name__ == '__main__':
-    model = VisionTransformer(64, 8, 4, 4, 3, 256, 1024, 0.1, 0.1,  10)
-    print(model)
+def vit_b_16(image_size, num_classes):
+    return VisionTransformer(
+        image_size=image_size,
+        patch_size=16,
+        num_layers=12,
+        num_heads=12,
+        hidden_dim=768,
+        mlp_dim=3072,
+        dropout=0.1,
+        attention_dropout=0.1,
+        num_classes=num_classes
+    )
 
-    x = torch.rand((4, 3, 64, 64))
-    x = model(x)
 
-    print(x)
+def vit_b_32(image_size, num_classes):
+    return VisionTransformer(
+        image_size=image_size,
+        patch_size=32,
+        num_layers=12,
+        num_heads=12,
+        hidden_dim=768,
+        mlp_dim=3072,
+        dropout=0.1,
+        attention_dropout=0.1,
+        num_classes=num_classes
+    )
+
+
+def vit_l_16(image_size, num_classes):
+    return VisionTransformer(
+        image_size=image_size,
+        patch_size=16,
+        num_layers=24,
+        num_heads=16,
+        hidden_dim=1024,
+        mlp_dim=4096,
+        dropout=0.2,
+        attention_dropout=0.2,
+        num_classes=num_classes
+    )
+
+
+def vit_l_32(image_size, num_classes):
+    return VisionTransformer(
+        image_size=image_size,
+        patch_size=32,
+        num_layers=24,
+        num_heads=16,
+        hidden_dim=1024,
+        mlp_dim=4096,
+        dropout=0.2,
+        attention_dropout=0.2,
+        num_classes=num_classes
+    )
+
+
+def vit_h_14(image_size, num_classes):
+    return VisionTransformer(
+        image_size=image_size,
+        patch_size=14,
+        num_layers=32,
+        num_heads=16,
+        hidden_dim=1280,
+        mlp_dim=5120,
+        dropout=0.3,
+        attention_dropout=0.3,
+        num_classes=num_classes
+    )
